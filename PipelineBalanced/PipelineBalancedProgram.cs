@@ -2,8 +2,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,9 +10,17 @@ namespace PipelineBalanced
     class PipelineBalancedProgram
     {
         private static readonly int SHORTSTAGE = 100;
-        private static readonly int LONGSTAGE = 200;
-        private static readonly int ARRAYSIZE = 10;
-        
+        private static readonly int LONGSTAGE = SHORTSTAGE*2;
+        private static readonly int ARRAYSIZE = 100;
+        private static readonly int BUFFERSIZE = 15;
+
+        private static int stage2QueueMax;
+        private static int multi1QueueMax;
+        private static int multi2QueueMax;
+        private static int stage3QueueMax;
+        private static int stage4QueueMax;
+        private static int lookAheadMax;
+
         private static Stopwatch st = new Stopwatch();
         private static List<int> result = new List<int>();
 
@@ -29,14 +35,13 @@ namespace PipelineBalanced
         {
             using (CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
-                var bufferSize = 10;
                 var data = InitializeData(ARRAYSIZE);
 
-                var stage1To2Buffer = new BlockingCollection<int>(bufferSize);
-                var stage2ToMultiplexerBuffer1 = new BlockingCollection<int>(bufferSize);
-                var stage2ToMultiplexerBuffer2 = new BlockingCollection<int>(bufferSize);
-                var multiplexerToStage3Buffer = new BlockingCollection<int>(bufferSize);
-                var stage3To4Buffer = new BlockingCollection<int>(bufferSize);
+                var stage1To2Buffer = new BlockingCollection<int>(BUFFERSIZE);
+                var stage2ToMultiplexerBuffer1 = new BlockingCollection<int>(BUFFERSIZE);
+                var stage2ToMultiplexerBuffer2 = new BlockingCollection<int>(BUFFERSIZE);
+                var multiplexerToStage3Buffer = new BlockingCollection<int>(BUFFERSIZE);
+                var stage3To4Buffer = new BlockingCollection<int>(BUFFERSIZE);
 
                 var factory = new TaskFactory(TaskCreationOptions.LongRunning, TaskContinuationOptions.None);
 
@@ -88,12 +93,14 @@ namespace PipelineBalanced
         {
             try
             {
+                
                 var token = cts.Token;
                 foreach (int number in input.GetConsumingEnumerable())
                 {
                     if (token.IsCancellationRequested)
                         break;
-                    //if (number == 4) throw new OperationCanceledException();
+                    if (stage2QueueMax < input.Count)
+                    stage2QueueMax = input.Count;
                     Thread.Sleep(LONGSTAGE);
                     output.Add(number, token);
                     Console.WriteLine("    Stage 2 processed number {0}", number);
@@ -122,29 +129,42 @@ namespace PipelineBalanced
             try
             {
                 var token = cts.Token;
-                var producers = new BlockingCollection<int>[2] { input1, input2 };
-                var nextExpected = 0;
+                bool roundRobin = true;
+                var nextExpected = 1;
                 int number = -1;
                 var lookAhead = new HashSet<int>();
-                while (!input1.IsCompleted || !input2.IsCompleted)
+                while (!(input1.IsCompleted && input2.IsCompleted))
                 {
                     if (token.IsCancellationRequested)
                         break;
-                    
-                    if (BlockingCollection<int>.TryTakeFromAny(producers, out number) != -1 && number == nextExpected)
+                    if (multi1QueueMax < input1.Count)
+                        multi1QueueMax = input1.Count;
+                    if (multi2QueueMax < input2.Count)
+                        multi2QueueMax = input2.Count;
+                    if (roundRobin)
+                    {
+                        input2.TryTake(out number);
+                    }
+                    else
+                        input1.TryTake(out number);
+                    roundRobin = !roundRobin;
+                    if (number == nextExpected)
                     {
                         output.Add(number);
-                        Console.WriteLine("Multiplexer added number {0}", number);
                         nextExpected++;
+                        Console.WriteLine("Multiplexer added number {0}", number);
                     }
                     else if (lookAhead.Contains(nextExpected))
                     {
                         lookAhead.Remove(nextExpected);
-                        output.Add(nextExpected);
+                        output.Add(nextExpected, token);
                         nextExpected++;
+                        lookAhead.Add(number);
                     }
                     else
                         lookAhead.Add(number);
+                    if (lookAheadMax < lookAhead.Count)
+                        lookAheadMax = lookAhead.Count;
                 }
             }
             catch (Exception e)
@@ -174,6 +194,8 @@ namespace PipelineBalanced
                 {
                     if (token.IsCancellationRequested)
                         break;
+                    if (stage3QueueMax < input.Count)
+                        stage3QueueMax = input.Count;
                     Thread.Sleep(SHORTSTAGE);
                     output.Add(number, token);
                     Console.WriteLine("        Stage 3 processed number {0}", number);
@@ -205,6 +227,8 @@ namespace PipelineBalanced
                 {
                     if (token.IsCancellationRequested)
                         break;
+                    if (stage4QueueMax < input.Count)
+                        stage4QueueMax = input.Count;
                     Thread.Sleep(SHORTSTAGE);
                     result.Add(number);
                     Console.WriteLine("            Stage 4 processed number {0} - Time: {1}", number, st.ElapsedMilliseconds);
@@ -224,27 +248,38 @@ namespace PipelineBalanced
             finally
             {
                 Console.WriteLine("Stage 4 stopped");
-                
+                st.Stop();
             }
             }
 
         private static int[] InitializeData(int size)
         {
             var data = new int[size];
-            for (int i = 0; i < size; i++)
+            for (int i = 1; i < size + 1; i++)
             {
-                data[i] = i;
+                data[i - 1] = i;
             }
             return data;
         }
 
         private static void PrintResult()
         {
-            Console.WriteLine("Result:");
+            Console.WriteLine("\n\n\nResult:");
+            int line = 0;
             foreach (var item in result)
             {
                 Console.Write("{0} ", item);
+                line++;
+                    if(line == 10)
+                {
+                    Console.Write("\n");
+                    line = 0;
+                }
             }
+            Console.WriteLine("\n\nTotal time taken: {0}ms", st.ElapsedMilliseconds);
+            Console.WriteLine("\nMax number of elements in buffers:\nBuffer between stage 1 and 2: {0}\nMultiplexer buffer 1: {1}\nMultiplexer buffer 2: {2}\n" +
+                "Buffer between multiplexer and stage 3: {3}\nBuffer between stage 3 and 4  3: {4}\nLookAhead buffer: {5}",
+                stage2QueueMax, multi1QueueMax, multi2QueueMax, stage3QueueMax, stage4QueueMax, lookAheadMax);
             Console.ReadLine();
         }
     }
